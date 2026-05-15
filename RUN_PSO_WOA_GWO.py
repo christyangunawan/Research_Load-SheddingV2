@@ -7,8 +7,8 @@ import pandas as pd
 import re
 
 # --- KONFIGURASI SISTEM ---
-TARGET_GEN_TRIP = "DG_3"
-EXCEL_OUTPUT = "PARETO_Comparison_Result_Breakdown_MOO.xlsx"
+TARGET_GEN_TRIP = "DG_1"
+EXCEL_OUTPUT = "DG 1_RUN 1.xlsx"
 
 # Parameter Optimasi
 SEARCH_AGENTS = 25
@@ -16,7 +16,7 @@ MAX_ITER = 50
 DIMENSION = 33
 
 USE_HARDCODED_TARGET = True
-TARGET_DEFICIT_MW = 1.200
+TARGET_DEFICIT_MW = 1.300
 
 # Parameter Algoritma
 W_MAX = 0.9
@@ -26,11 +26,26 @@ C2_PSO = 2.0
 VOLT_MIN = 0.95
 VOLT_MAX = 1.05
 
+# Parameter Simulasi RMS
+RMS_TSTOP = 100.0        # Total waktu simulasi (detik)
+RMS_TSAMPLE = 30.0       # Waktu pengambilan data tegangan (detik)
+TIME_GEN_TRIP = 1.0      # Waktu generator trip di simulasi RMS (detik)
+TIME_LOAD_SHED = 1.46    # Waktu pelepasan beban di simulasi RMS (detik)
+
+load_shed_events = []    # List untuk menyimpan event load shedding
+
+# Parameter Frekuensi Steady-State
+FREQ_TOLERANCE = 0.05    # Toleransi steady-state (±Hz dari nilai akhir)
+FREQ_SETTLE_WINDOW = 2.0 # Frekuensi harus bertahan dalam band selama (detik)
+FREQ_AVG_WINDOW = 5.0    # Rata-rata frekuensi N detik terakhir sebagai nilai final
+FREQ_REF_BUS_IDX = 0     # Indeks bus referensi untuk frekuensi (bus pertama)
+VOLT_MONITOR_BUS_IDX = 17 # Indeks bus untuk monitoring tegangan vs waktu di export
+
 # Path DIgSILENT PowerFactory
 VERSION_PYTHON = "3.12"
 PATH_APP = r"C:\Program Files\DIgSILENT\PowerFactory 2024"
 PATH_API = fr"{PATH_APP}\Python\{VERSION_PYTHON}"
-PROJECT_NAME = "Import(1)"
+PROJECT_NAME = "Import(3)"
 
 if PATH_API not in sys.path: sys.path.append(PATH_API)
 os.environ['PATH'] = PATH_APP + ";" + os.environ['PATH']
@@ -43,7 +58,16 @@ except ImportError:
 
 app = powerfactory.GetApplication()
 app.ActivateProject(PROJECT_NAME)
-ldf = app.GetFromStudyCase("ComLdf")
+# Inisialisasi perintah simulasi RMS
+inc = app.GetFromStudyCase("ComInc")   # Initial Conditions
+sim = app.GetFromStudyCase("ComSim")   # RMS Simulation
+elmres = app.GetFromStudyCase("All calculations.ElmRes")  # Result Object
+
+# Debug: verifikasi objek simulasi
+print(f"[INIT] ComInc: {inc}, ComSim: {sim}, ElmRes: {elmres}")
+
+# Konfigurasi waktu simulasi
+sim.tstop = RMS_TSTOP
 
 
 # --- FUNGSI PENDUKUNG ---
@@ -55,8 +79,174 @@ def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
 
-def get_voltage_array():
-    return [b.GetAttribute("m:u") for b in all_buses]
+def setup_rms_simulation_and_events():
+    """Menyiapkan result variables dan dynamic events (trip) untuk RMS."""
+    global load_shed_events
+    # Link result object ke ComInc agar data terekam saat simulasi
+    inc.p_resvar = elmres
+
+    elmres.Clear()
+    for bus in all_buses:
+        elmres.AddVars(bus, "m:u")
+
+    # Tambahkan frekuensi pada bus referensi
+    ref_bus = all_buses[FREQ_REF_BUS_IDX]
+    elmres.AddVars(ref_bus, "m:fehz")
+
+    # --- Setup Dynamic Events ---
+    sc = app.GetActiveStudyCase()
+    evt_folder = app.GetFromStudyCase("IntEvt")
+    if not evt_folder:
+        evt_folder = sc.CreateObject("IntEvt", "Events")
+
+    # Bersihkan event lama jika ada
+    for evt in evt_folder.GetContents():
+        evt.Delete()
+
+    # Event Generator Trip
+    target_gen = next((g for g in all_gens if g.GetAttribute("loc_name") in [TARGET_GEN_TRIP, TARGET_GEN_TRIP.replace("_", " ")]), None)
+    if target_gen:
+        gen_evt = evt_folder.CreateObject("EvtSwitch", f"Trip Gen {TARGET_GEN_TRIP}")
+        gen_evt.p_target = target_gen
+        gen_evt.time = TIME_GEN_TRIP
+        try:
+            gen_evt.i_all = 0
+            gen_evt.i_switch = 0
+        except: pass
+
+    # Event Load Shedding
+    load_shed_events = []
+    for load in all_loads:
+        load_evt = evt_folder.CreateObject("EvtSwitch", f"Shed {load.GetAttribute('loc_name')}")
+        load_evt.p_target = load
+        load_evt.time = TIME_LOAD_SHED
+        try:
+            load_evt.i_all = 0
+            load_evt.i_switch = 0
+        except: pass
+        load_evt.outserv = 1  # Disable secara default
+        load_shed_events.append(load_evt)
+
+    print(f"RMS Configured: Voltage on {len(all_buses)} buses, Freq on '{ref_bus.GetAttribute('loc_name')}'.")
+    print(f"RMS Events Configured: Gen Trip at {TIME_GEN_TRIP}s, Load Shed at {TIME_LOAD_SHED}s.")
+
+
+def extract_rms_results():
+    """Membaca tegangan (pada RMS_TSAMPLE) dan settling time frekuensi dalam satu pass.
+    Menghindari double elmres.Load() dan iterasi 10k+ baris berulang kali.
+    """
+    elmres.Load()
+    n_rows = elmres.GetNumberOfRows()
+
+    if n_rows == 0:
+        return [0.0], RMS_TSTOP
+
+    # Siapkan pencarian kolom (gunakan try/except jika butuh aman, tapi FindColumn mengembalikan -1 jika gagal)
+    ref_bus = all_buses[FREQ_REF_BUS_IDX]
+    freq_col = elmres.FindColumn(ref_bus, "m:fehz")
+
+    volt_cols = []
+    for bus in all_buses:
+        volt_cols.append(elmres.FindColumn(bus, "m:u"))
+
+    # Single pass: kumpulkan time series frekuensi dan cari baris terdekat untuk tegangan
+    times = []
+    freqs = []
+    best_row = 0
+    min_diff = float('inf')
+
+    for row in range(n_rows):
+        t_val = elmres.GetValue(row, -1)
+        t = t_val[1] if isinstance(t_val, (list, tuple)) else t_val
+        times.append(t)
+
+        # Cari row untuk tegangan (sekitar RMS_TSAMPLE)
+        diff = abs(t - RMS_TSAMPLE)
+        if diff < min_diff:
+            min_diff = diff
+            best_row = row
+
+        # Ambil frekuensi
+        if freq_col >= 0:
+            f_val = elmres.GetValue(row, freq_col)
+            freqs.append(f_val[1] if isinstance(f_val, (list, tuple)) else f_val)
+
+    # --- Ekstrak Tegangan (hanya pada best_row) ---
+    voltages = []
+    for col_idx in volt_cols:
+        if col_idx >= 0:
+            val = elmres.GetValue(best_row, col_idx)
+            voltages.append(val[1] if isinstance(val, (list, tuple)) else val)
+    if not voltages:
+        voltages = [0.0]
+
+    # --- Ekstrak Settling Time ---
+    settle_time = RMS_TSTOP
+    if freqs:
+        t_end = times[-1]
+        final_freqs = [freqs[i] for i in range(len(times)) if times[i] >= (t_end - FREQ_AVG_WINDOW)]
+        f_final = sum(final_freqs) / len(final_freqs) if final_freqs else freqs[-1]
+
+        f_min = f_final - FREQ_TOLERANCE
+        f_max = f_final + FREQ_TOLERANCE
+
+        for i in range(len(times)):
+            if f_min <= freqs[i] <= f_max:
+                settle_ok = True
+                for j in range(i, len(times)):
+                    if times[j] - times[i] > FREQ_SETTLE_WINDOW:
+                        break
+                    if not (f_min <= freqs[j] <= f_max):
+                        settle_ok = False
+                        break
+                if settle_ok and (times[min(j, len(times)-1)] - times[i]) >= FREQ_SETTLE_WINDOW:
+                    settle_time = times[i]
+                    break
+
+    return voltages, settle_time
+
+
+def simulate_and_extract_timeseries(pattern):
+    """Re-simulate pola terbaik dan ekstrak time series frekuensi & tegangan."""
+    # Terapkan pola load shedding ke event (bukan ke beban langsung)
+    for i in range(len(all_loads)):
+        load_shed_events[i].outserv = 0 if pattern[i] == 1 else 1
+
+    # Jalankan simulasi RMS
+    err_inc = inc.Execute()
+    if err_inc != 0:
+        return None, None
+    err_sim = sim.Execute()
+    if err_sim != 0:
+        return None, None
+
+    elmres.Load()
+    n_rows = elmres.GetNumberOfRows()
+    if n_rows == 0:
+        return None, None
+
+    ref_bus = all_buses[FREQ_REF_BUS_IDX]
+    freq_col = elmres.FindColumn(ref_bus, "m:fehz")
+    mon_bus = all_buses[VOLT_MONITOR_BUS_IDX]
+    volt_col = elmres.FindColumn(mon_bus, "m:u")
+
+    times, freqs, volts = [], [], []
+    for row in range(n_rows):
+        t_val = elmres.GetValue(row, -1)
+        t = t_val[1] if isinstance(t_val, (list, tuple)) else t_val
+        times.append(t)
+
+        if freq_col >= 0:
+            f_val = elmres.GetValue(row, freq_col)
+            freqs.append(f_val[1] if isinstance(f_val, (list, tuple)) else f_val)
+        if volt_col >= 0:
+            v_val = elmres.GetValue(row, volt_col)
+            volts.append(v_val[1] if isinstance(v_val, (list, tuple)) else v_val)
+
+    freq_df = pd.DataFrame({"Time_s": times, "Frequency_Hz": freqs}) if freqs else None
+    volt_df = pd.DataFrame({"Time_s": times, f"Voltage_{mon_bus.GetAttribute('loc_name')}_pu": volts}) if volts else None
+
+    return freq_df, volt_df
 
 
 # --- METRIK MOO ---
@@ -70,7 +260,8 @@ def normalize_pareto(pareto):
 def compute_hypervolume(pareto):
     if not pareto: return 0
     norm = normalize_pareto(pareto)
-    ref = np.array([1.1, 1.1, 1.1])
+    n_obj = norm.shape[1]
+    ref = np.full(n_obj, 1.1)
     return sum(np.prod(ref - p) for p in norm)
 
 
@@ -120,16 +311,9 @@ for i in range(len(all_loads)):
 
 # --- CORE LOGIC ---
 def apply_contingency_and_reset():
-    print("Resetting System & Applying Contingency...")
+    print("Resetting System (Ensuring all elements are in-service)...")
     for l in all_loads: l.SetAttribute("outserv", 0)
     for g in all_gens: g.SetAttribute("outserv", 0)
-
-    target = next(
-        (g for g in all_gens if g.GetAttribute("loc_name") in [TARGET_GEN_TRIP, TARGET_GEN_TRIP.replace("_", " ")]),
-        None)
-    if target:
-        target.SetAttribute("outserv", 1)
-        print(f"Generator {target.GetAttribute('loc_name')} TRIPPED.")
     return TARGET_DEFICIT_MW
 
 
@@ -137,11 +321,23 @@ def calculate_fitness(position_continuous, min_shed_required):
     probs = sigmoid(position_continuous)
     pattern = (np.random.rand(len(position_continuous)) < probs).astype(int)
 
-    for i, load in enumerate(all_loads):
-        load.SetAttribute("outserv", int(pattern[i]))
+    # Terapkan pola load shedding ke dynamic events (Aktifkan event jika pattern = 1)
+    for i in range(len(all_loads)):
+        load_shed_events[i].outserv = 0 if pattern[i] == 1 else 1
 
-    err = ldf.Execute()
-    voltages = get_voltage_array()
+    # Jalankan simulasi RMS (Initial Conditions + Simulation)
+    err_inc = inc.Execute()
+    if err_inc == 0:
+        err_sim = sim.Execute()
+    else:
+        err_sim = 1
+    err = 0 if (err_inc == 0 and err_sim == 0) else 1
+
+    # Ambil tegangan dan settling time dalam satu pass baca
+    if err == 0:
+        voltages, settle_time = extract_rms_results()
+    else:
+        voltages, settle_time = [0.0], RMS_TSTOP
 
     total_mw = sum(all_loads[i].GetAttribute("plini") for i, val in enumerate(pattern) if val == 1)
     cost = sum(all_loads[i].GetAttribute("plini") * COST_MAP[i] for i, val in enumerate(pattern) if val == 1)
@@ -151,20 +347,21 @@ def calculate_fitness(position_continuous, min_shed_required):
     feasible = (err == 0) and (total_mw >= (min_shed_required - 0.001)) and (min(voltages) >= VOLT_MIN)
 
     return {
-        "objectives": [cost, vdi, over],
-        "MW": total_mw, "Cost": cost, "VDI": vdi, "Over": over,
+        "objectives": [cost, vdi, over, settle_time],
+        "MW": total_mw, "Cost": cost, "VDI": vdi, "Over": over, "Settle": settle_time,
         "feasible": feasible, "voltages": voltages, "pattern": pattern, "min_v": min(voltages) if voltages else 0
     }
 
 
 def update_archive(archive, candidate):
     if not candidate["feasible"]: return archive
+    n_obj = len(candidate["objectives"])
     # Dominance Check
     new_archive = [sol for sol in archive if not (
-                all(candidate["objectives"][k] <= sol["objectives"][k] for k in range(3)) and any(
-            candidate["objectives"][k] < sol["objectives"][k] for k in range(3)))]
-    if not any(all(sol["objectives"][k] <= candidate["objectives"][k] for k in range(3)) and any(
-            sol["objectives"][k] < candidate["objectives"][k] for k in range(3)) for sol in archive):
+                all(candidate["objectives"][k] <= sol["objectives"][k] for k in range(n_obj)) and any(
+            candidate["objectives"][k] < sol["objectives"][k] for k in range(n_obj)))]
+    if not any(all(sol["objectives"][k] <= candidate["objectives"][k] for k in range(n_obj)) and any(
+            sol["objectives"][k] < candidate["objectives"][k] for k in range(n_obj)) for sol in archive):
         new_archive.append(candidate)
     return new_archive
 
@@ -180,7 +377,15 @@ class Optimizer:
         self.P_best_pos = self.X.copy()
         self.P_best_score = np.full(SEARCH_AGENTS, float('inf'))
         self.G_best_pos = np.zeros(self.dim)
-        self.G_best_metrics = {'Cost': 0}
+        self.G_best_metrics = {'Cost': 0, 'MW': 0, 'VDI': 0, 'Over': 0, 'Vmin': 0, 'Settle': 0}
+
+        # GWO: 3 leaders (alpha, beta, delta)
+        self.alpha_pos = np.zeros(self.dim)
+        self.alpha_score = float('inf')
+        self.beta_pos = np.zeros(self.dim)
+        self.beta_score = float('inf')
+        self.delta_pos = np.zeros(self.dim)
+        self.delta_score = float('inf')
 
     def run(self):
         start_time = time.time()
@@ -197,19 +402,39 @@ class Optimizer:
                     self.P_best_score[i] = sol["Cost"]
                     self.P_best_pos[i] = self.X[i].copy()
 
+                # Update GWO leaders (alpha, beta, delta)
+                if self.algo_name == "GWO" and sol["feasible"]:
+                    if sol["Cost"] < self.alpha_score:
+                        self.delta_score = self.beta_score
+                        self.delta_pos = self.beta_pos.copy()
+                        self.beta_score = self.alpha_score
+                        self.beta_pos = self.alpha_pos.copy()
+                        self.alpha_score = sol["Cost"]
+                        self.alpha_pos = self.X[i].copy()
+                    elif sol["Cost"] < self.beta_score:
+                        self.delta_score = self.beta_score
+                        self.delta_pos = self.beta_pos.copy()
+                        self.beta_score = sol["Cost"]
+                        self.beta_pos = self.X[i].copy()
+                    elif sol["Cost"] < self.delta_score:
+                        self.delta_score = sol["Cost"]
+                        self.delta_pos = self.X[i].copy()
+
                 self.detailed_log.append({
                     "Iteration": t + 1, "Agent_ID": i + 1,
                     "Cost": sol["Cost"], "VDI": sol["VDI"], "Overshed": sol["Over"],
+                    "Settle": sol["Settle"],
                     "Feasible": sol["feasible"], "Pattern": "".join(map(str, sol["pattern"]))
                 })
 
 
             if self.archive:
-                leader = random.choice(self.archive)
+                leader = find_knee(self.archive)
                 self.G_best_pos = leader["pattern"]
                 self.G_best_metrics = {
                     'MW': leader["MW"], 'Cost': leader["Cost"],
-                    'VDI': leader["VDI"], 'Over': leader["Over"], 'Vmin': leader["min_v"]
+                    'VDI': leader["VDI"], 'Over': leader["Over"], 'Vmin': leader["min_v"],
+                    'Settle': leader["Settle"]
                 }
 
             self.convergence_curve.append(self.G_best_metrics['Cost'])
@@ -224,9 +449,26 @@ class Optimizer:
                                 C2_PSO * r2 * (self.G_best_pos - self.X[i]))
                     self.X[i] += np.clip(self.V[i], -5, 5)
                 elif self.algo_name == "GWO":
-                    A, C = 2.0 * a * np.random.random(self.dim) - a, 2.0 * np.random.random(self.dim)
-                    D = np.abs(C * self.G_best_pos - self.X[i])
-                    self.X[i] = self.G_best_pos - A * D
+                    # Alpha guidance
+                    A1 = 2.0 * a * np.random.random(self.dim) - a
+                    C1 = 2.0 * np.random.random(self.dim)
+                    D_alpha = np.abs(C1 * self.alpha_pos - self.X[i])
+                    X1 = self.alpha_pos - A1 * D_alpha
+
+                    # Beta guidance
+                    A2 = 2.0 * a * np.random.random(self.dim) - a
+                    C2 = 2.0 * np.random.random(self.dim)
+                    D_beta = np.abs(C2 * self.beta_pos - self.X[i])
+                    X2 = self.beta_pos - A2 * D_beta
+
+                    # Delta guidance
+                    A3 = 2.0 * a * np.random.random(self.dim) - a
+                    C3 = 2.0 * np.random.random(self.dim)
+                    D_delta = np.abs(C3 * self.delta_pos - self.X[i])
+                    X3 = self.delta_pos - A3 * D_delta
+
+                    # Position update: average of 3 leaders
+                    self.X[i] = (X1 + X2 + X3) / 3.0
                 elif self.algo_name == "WOA":
                     p, l = np.random.random(), np.random.uniform(-1, 1)
                     if p < 0.5:
@@ -242,6 +484,7 @@ class Optimizer:
 
 if __name__ == "__main__":
     calc_target = apply_contingency_and_reset()
+    setup_rms_simulation_and_events()  # Setup result variables & dynamic RMS events
     results_store = {}
     algos = ["PSO", "WOA", "GWO"]
 
@@ -257,8 +500,8 @@ if __name__ == "__main__":
     with pd.ExcelWriter(EXCEL_OUTPUT, engine='openpyxl') as writer:
         # 1. Summary Sheet
         summary_df = pd.DataFrame([{
-            "Algorithm": a, "Knee_Cost": results_store[a]["Metrics"]["Cost"],
-            "Knee_Vmin": results_store[a]["Metrics"]["Vmin"], "Time_Sec": results_store[a]["Time"]
+            "Algorithm": a, "Knee_Cost": results_store[a]["Metrics"].get("Cost", 0),
+            "Knee_Vmin": results_store[a]["Metrics"].get("Vmin", 0), "Time_Sec": results_store[a]["Time"]
         } for a in algos])
         summary_df.to_excel(writer, sheet_name='Summary', index=False)
 
@@ -270,17 +513,66 @@ if __name__ == "__main__":
             # Pareto List
             pd.DataFrame([{
                 "Cost": s["objectives"][0], "VDI": s["objectives"][1],
-                "Overshed": s["objectives"][2], "MW": s["MW"]
+                "Overshed": s["objectives"][2], "Settle_Time": s["objectives"][3], "MW": s["MW"]
             } for s in pareto]).to_excel(writer, sheet_name=f"Pareto_{algo}", index=False)
 
             # MOO Quality Metrics
             hv, sp, knee = compute_hypervolume(pareto), compute_spacing(pareto), find_knee(pareto)
             pd.DataFrame([{
                 "Hypervolume": hv, "Spacing": sp,
-                "Knee_Cost": knee["objectives"][0], "Knee_VDI": knee["objectives"][1]
+                "Knee_Cost": knee["objectives"][0], "Knee_VDI": knee["objectives"][1],
+                "Knee_Settle": knee["objectives"][3]
             }]).to_excel(writer, sheet_name=f"MOO_{algo}", index=False)
 
             # Logs
             pd.DataFrame(results_store[algo]["Log"]).to_excel(writer, sheet_name=f"Log_{algo}", index=False)
+
+        # 3. GBest Detail Sheets per Algorithm
+        for algo in algos:
+            pareto = results_store[algo]["Pareto"]
+            if not pareto:
+                continue
+
+            # Cari knee point sebagai solusi terbaik
+            knee = find_knee(pareto)
+            if knee is None:
+                continue
+
+            best_pattern = knee["pattern"]
+
+            # --- Sheet: Load Shedding Summary ---
+            shed_rows = []
+            for i, load in enumerate(all_loads):
+                load_name = load.GetAttribute("loc_name")
+                load_mw = load.GetAttribute("plini")
+                shed_rows.append({
+                    "Load_Name": load_name,
+                    "Zone": ZONE_LABELS[i],
+                    "Cost_Weight": COST_MAP[i],
+                    "MW": load_mw,
+                    "Shed": "YES" if best_pattern[i] == 1 else "NO"
+                })
+
+            shed_df = pd.DataFrame(shed_rows)
+
+            # Tambahkan baris summary di bawah
+            summary_row = pd.DataFrame([{
+                "Load_Name": "--- TOTAL ---",
+                "Zone": "",
+                "Cost_Weight": "",
+                "MW": knee["MW"],
+                "Shed": f"Cost={knee['Cost']:.2f}, VDI={knee['VDI']:.6f}, Over={knee['Over']:.3f}, Settle={knee['Settle']:.2f}s"
+            }])
+            shed_df = pd.concat([shed_df, summary_row], ignore_index=True)
+            shed_df.to_excel(writer, sheet_name=f"GBest_{algo}", index=False)
+
+            # --- Re-simulate untuk time series ---
+            print(f"Re-simulating G_best for {algo}...")
+            freq_df, volt_df = simulate_and_extract_timeseries(best_pattern)
+
+            if freq_df is not None:
+                freq_df.to_excel(writer, sheet_name=f"Freq_{algo}", index=False)
+            if volt_df is not None:
+                volt_df.to_excel(writer, sheet_name=f"Volt_{algo}", index=False)
 
     print("Proses Selesai Berhasil.")

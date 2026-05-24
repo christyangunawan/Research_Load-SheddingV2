@@ -9,6 +9,7 @@ import re
 # --- KONFIGURASI SISTEM ---
 TARGET_GEN_TRIP = "DG_1"
 EXCEL_OUTPUT = "DG 1_RUN 1.xlsx"
+TOTAL_RUNS = 5  # Jumlah eksekusi algoritma berulang (otomatis bertambah)
 
 # Parameter Optimasi
 SEARCH_AGENTS = 25
@@ -16,7 +17,7 @@ MAX_ITER = 50
 DIMENSION = 33
 
 USE_HARDCODED_TARGET = True
-TARGET_DEFICIT_MW = 1.300
+TARGET_DEFICIT_MW = 1.350
 
 # Parameter Algoritma
 W_MAX = 0.9
@@ -45,7 +46,7 @@ VOLT_MONITOR_BUS_IDX = 17 # Indeks bus untuk monitoring tegangan vs waktu di exp
 VERSION_PYTHON = "3.12"
 PATH_APP = r"C:\Program Files\DIgSILENT\PowerFactory 2024"
 PATH_API = fr"{PATH_APP}\Python\{VERSION_PYTHON}"
-PROJECT_NAME = "Import(3)"
+PROJECT_NAME = "Import(6)"
 
 if PATH_API not in sys.path: sys.path.append(PATH_API)
 os.environ['PATH'] = PATH_APP + ";" + os.environ['PATH']
@@ -58,6 +59,11 @@ except ImportError:
 
 app = powerfactory.GetApplication()
 app.ActivateProject(PROJECT_NAME)
+try:
+    app.EchoOff() # Mematikan update teks/konsol di PowerFactory (sangat mempercepat simulasi)
+except:
+    pass
+
 # Inisialisasi perintah simulasi RMS
 inc = app.GetFromStudyCase("ComInc")   # Initial Conditions
 sim = app.GetFromStudyCase("ComSim")   # RMS Simulation
@@ -132,16 +138,16 @@ def setup_rms_simulation_and_events():
 
 
 def extract_rms_results():
-    """Membaca tegangan (pada RMS_TSAMPLE) dan settling time frekuensi dalam satu pass.
-    Menghindari double elmres.Load() dan iterasi 10k+ baris berulang kali.
+    """Membaca tegangan (pada RMS_TSAMPLE) dan settling time frekuensi secara optimal.
+    Menghindari iterasi 10k+ baris berulang kali dengan Binary Search dan sparse sampling.
     """
     elmres.Load()
     n_rows = elmres.GetNumberOfRows()
 
     if n_rows == 0:
+        elmres.Release()
         return [0.0], RMS_TSTOP
 
-    # Siapkan pencarian kolom (gunakan try/except jika butuh aman, tapi FindColumn mengembalikan -1 jika gagal)
     ref_bus = all_buses[FREQ_REF_BUS_IDX]
     freq_col = elmres.FindColumn(ref_bus, "m:fehz")
 
@@ -149,29 +155,32 @@ def extract_rms_results():
     for bus in all_buses:
         volt_cols.append(elmres.FindColumn(bus, "m:u"))
 
-    # Single pass: kumpulkan time series frekuensi dan cari baris terdekat untuk tegangan
-    times = []
-    freqs = []
+    # 1. Binary Search untuk mendapatkan baris terdekat dengan RMS_TSAMPLE (30s)
+    low = 0
+    high = n_rows - 1
     best_row = 0
     min_diff = float('inf')
 
-    for row in range(n_rows):
-        t_val = elmres.GetValue(row, -1)
+    while low <= high:
+        mid = (low + high) // 2
+        t_val = elmres.GetValue(mid, -1)
         t = t_val[1] if isinstance(t_val, (list, tuple)) else t_val
-        times.append(t)
+        
+        diff = t - RMS_TSAMPLE
+        abs_diff = abs(diff)
+        
+        if abs_diff < min_diff:
+            min_diff = abs_diff
+            best_row = mid
+            
+        if diff == 0:
+            break
+        elif diff < 0:
+            low = mid + 1
+        else:
+            high = mid - 1
 
-        # Cari row untuk tegangan (sekitar RMS_TSAMPLE)
-        diff = abs(t - RMS_TSAMPLE)
-        if diff < min_diff:
-            min_diff = diff
-            best_row = row
-
-        # Ambil frekuensi
-        if freq_col >= 0:
-            f_val = elmres.GetValue(row, freq_col)
-            freqs.append(f_val[1] if isinstance(f_val, (list, tuple)) else f_val)
-
-    # --- Ekstrak Tegangan (hanya pada best_row) ---
+    # Ambil tegangan HANYA pada best_row
     voltages = []
     for col_idx in volt_cols:
         if col_idx >= 0:
@@ -180,9 +189,20 @@ def extract_rms_results():
     if not voltages:
         voltages = [0.0]
 
-    # --- Ekstrak Settling Time ---
+    # 2. Full-read frekuensi untuk settle time (presisi penuh, tidak ada data yang terlewat)
     settle_time = RMS_TSTOP
-    if freqs:
+    if freq_col >= 0:
+        times = []
+        freqs = []
+
+        for row in range(n_rows):
+            t_val = elmres.GetValue(row, -1)
+            t = t_val[1] if isinstance(t_val, (list, tuple)) else t_val
+            times.append(t)
+
+            f_val = elmres.GetValue(row, freq_col)
+            freqs.append(f_val[1] if isinstance(f_val, (list, tuple)) else f_val)
+
         t_end = times[-1]
         final_freqs = [freqs[i] for i in range(len(times)) if times[i] >= (t_end - FREQ_AVG_WINDOW)]
         f_final = sum(final_freqs) / len(final_freqs) if final_freqs else freqs[-1]
@@ -193,16 +213,19 @@ def extract_rms_results():
         for i in range(len(times)):
             if f_min <= freqs[i] <= f_max:
                 settle_ok = True
+                window_covered = False
                 for j in range(i, len(times)):
-                    if times[j] - times[i] > FREQ_SETTLE_WINDOW:
+                    if times[j] - times[i] >= FREQ_SETTLE_WINDOW:
+                        window_covered = True
                         break
                     if not (f_min <= freqs[j] <= f_max):
                         settle_ok = False
                         break
-                if settle_ok and (times[min(j, len(times)-1)] - times[i]) >= FREQ_SETTLE_WINDOW:
+                if settle_ok and window_covered:
                     settle_time = times[i]
                     break
 
+    elmres.Release()
     return voltages, settle_time
 
 
@@ -223,6 +246,7 @@ def simulate_and_extract_timeseries(pattern):
     elmres.Load()
     n_rows = elmres.GetNumberOfRows()
     if n_rows == 0:
+        elmres.Release()
         return None, None
 
     ref_bus = all_buses[FREQ_REF_BUS_IDX]
@@ -246,7 +270,12 @@ def simulate_and_extract_timeseries(pattern):
     freq_df = pd.DataFrame({"Time_s": times, "Frequency_Hz": freqs}) if freqs else None
     volt_df = pd.DataFrame({"Time_s": times, f"Voltage_{mon_bus.GetAttribute('loc_name')}_pu": volts}) if volts else None
 
+    elmres.Release()
     return freq_df, volt_df
+
+def dominates(obj1, obj2):
+    """Mengembalikan True jika obj1 mendominasi obj2 (Multi-Objective)."""
+    return all(obj1[k] <= obj2[k] for k in range(len(obj1))) and any(obj1[k] < obj2[k] for k in range(len(obj1)))
 
 
 # --- METRIK MOO ---
@@ -349,7 +378,8 @@ def calculate_fitness(position_continuous, min_shed_required):
     return {
         "objectives": [cost, vdi, over, settle_time],
         "MW": total_mw, "Cost": cost, "VDI": vdi, "Over": over, "Settle": settle_time,
-        "feasible": feasible, "voltages": voltages, "pattern": pattern, "min_v": min(voltages) if voltages else 0
+        "feasible": feasible, "voltages": voltages, "pattern": pattern, "min_v": min(voltages) if voltages else 0,
+        "continuous": position_continuous.copy()
     }
 
 
@@ -376,16 +406,14 @@ class Optimizer:
         self.V = np.zeros((SEARCH_AGENTS, self.dim))
         self.P_best_pos = self.X.copy()
         self.P_best_score = np.full(SEARCH_AGENTS, float('inf'))
+        self.P_best_objs = np.full((SEARCH_AGENTS, 4), float('inf'))
         self.G_best_pos = np.zeros(self.dim)
         self.G_best_metrics = {'Cost': 0, 'MW': 0, 'VDI': 0, 'Over': 0, 'Vmin': 0, 'Settle': 0}
 
         # GWO: 3 leaders (alpha, beta, delta)
         self.alpha_pos = np.zeros(self.dim)
-        self.alpha_score = float('inf')
         self.beta_pos = np.zeros(self.dim)
-        self.beta_score = float('inf')
         self.delta_pos = np.zeros(self.dim)
-        self.delta_score = float('inf')
 
     def run(self):
         start_time = time.time()
@@ -397,28 +425,21 @@ class Optimizer:
                 sol = calculate_fitness(self.X[i], self.min_shed_mw)
                 self.archive = update_archive(self.archive, sol)
 
-                # Update P_best
-                if sol["Cost"] < self.P_best_score[i] and sol["feasible"]:
-                    self.P_best_score[i] = sol["Cost"]
-                    self.P_best_pos[i] = self.X[i].copy()
-
-                # Update GWO leaders (alpha, beta, delta)
-                if self.algo_name == "GWO" and sol["feasible"]:
-                    if sol["Cost"] < self.alpha_score:
-                        self.delta_score = self.beta_score
-                        self.delta_pos = self.beta_pos.copy()
-                        self.beta_score = self.alpha_score
-                        self.beta_pos = self.alpha_pos.copy()
-                        self.alpha_score = sol["Cost"]
-                        self.alpha_pos = self.X[i].copy()
-                    elif sol["Cost"] < self.beta_score:
-                        self.delta_score = self.beta_score
-                        self.delta_pos = self.beta_pos.copy()
-                        self.beta_score = sol["Cost"]
-                        self.beta_pos = self.X[i].copy()
-                    elif sol["Cost"] < self.delta_score:
-                        self.delta_score = sol["Cost"]
-                        self.delta_pos = self.X[i].copy()
+                # Update P_best (Menggunakan Pareto Dominance untuk MOPSO)
+                if sol["feasible"]:
+                    if self.P_best_score[i] == float('inf'): # Belum ada P_best
+                        self.P_best_score[i] = sol["Cost"]
+                        self.P_best_objs[i] = sol["objectives"]
+                        self.P_best_pos[i] = self.X[i].copy()
+                    elif dominates(sol["objectives"], self.P_best_objs[i]): # Dominasi P_best lama
+                        self.P_best_score[i] = sol["Cost"]
+                        self.P_best_objs[i] = sol["objectives"]
+                        self.P_best_pos[i] = self.X[i].copy()
+                    elif not dominates(self.P_best_objs[i], sol["objectives"]): # Non-dominated
+                        if random.random() < 0.5: # 50% peluang menggantikan
+                            self.P_best_score[i] = sol["Cost"]
+                            self.P_best_objs[i] = sol["objectives"]
+                            self.P_best_pos[i] = self.X[i].copy()
 
                 self.detailed_log.append({
                     "Iteration": t + 1, "Agent_ID": i + 1,
@@ -430,12 +451,29 @@ class Optimizer:
 
             if self.archive:
                 leader = find_knee(self.archive)
-                self.G_best_pos = leader["pattern"]
+                self.G_best_pos = leader["continuous"].copy()
                 self.G_best_metrics = {
                     'MW': leader["MW"], 'Cost': leader["Cost"],
                     'VDI': leader["VDI"], 'Over': leader["Over"], 'Vmin': leader["min_v"],
                     'Settle': leader["Settle"]
                 }
+                
+                # Update Leader GWO (Alpha, Beta, Delta) dari Pareto Archive
+                if self.algo_name == "GWO":
+                    if len(self.archive) >= 3:
+                        arch_copy = [s for s in self.archive if s is not leader]
+                        random.shuffle(arch_copy)
+                        self.alpha_pos = leader["continuous"].copy()
+                        self.beta_pos = arch_copy[0]["continuous"].copy() if arch_copy else self.alpha_pos.copy()
+                        self.delta_pos = arch_copy[1]["continuous"].copy() if len(arch_copy) > 1 else self.beta_pos.copy()
+                    elif len(self.archive) == 2:
+                        self.alpha_pos = self.archive[0]["continuous"].copy()
+                        self.beta_pos = self.archive[1]["continuous"].copy()
+                        self.delta_pos = self.beta_pos.copy()
+                    else:
+                        self.alpha_pos = self.archive[0]["continuous"].copy()
+                        self.beta_pos = self.alpha_pos.copy()
+                        self.delta_pos = self.alpha_pos.copy()
 
             self.convergence_curve.append(self.G_best_metrics['Cost'])
             print(
@@ -478,101 +516,143 @@ class Optimizer:
                     else:
                         D_p = np.abs(self.G_best_pos - self.X[i])
                         self.X[i] = D_p * np.exp(1 * l) * np.cos(2 * np.pi * l) + self.G_best_pos
+            
+            # --- Clear Cache PowerFactory ---
+            # Hal ini dilakukan untuk mencegah penggunaan memori yang terus membengkak (berat) 
+            # akibat data simulasi dan objek yang menumpuk.
+            app.ResetCalculation()
+            app.ClearRecycleBin()
 
         return self.G_best_metrics, self.convergence_curve, time.time() - start_time, self.detailed_log, self.G_best_pos, self.archive
+
+def export_to_excel(results_dict, output_file):
+    """Mengekspor semua hasil yang ada di memori ke file Excel. Aman dipanggil berkali-kali."""
+    if not results_dict:
+        print("Tidak ada data untuk di-export.")
+        return
+        
+    print(f"Exporting (Auto-Save) to {output_file}...")
+    try:
+        with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+            # 1. Summary Sheet
+            summary_rows = []
+            for a, data in results_dict.items():
+                if "Metrics" in data:
+                    summary_rows.append({
+                        "Algorithm": a, 
+                        "Knee_Cost": data["Metrics"].get("Cost", 0),
+                        "Knee_Vmin": data["Metrics"].get("Vmin", 0), 
+                        "Time_Sec": data.get("Time", 0)
+                    })
+            if summary_rows:
+                pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Summary', index=False)
+
+            # 2. Pareto, MOO Metrics & Logs
+            for algo, data in results_dict.items():
+                pareto = data.get("Pareto", [])
+                if pareto:
+                    pd.DataFrame([{
+                        "Cost": s["objectives"][0], "VDI": s["objectives"][1],
+                        "Overshed": s["objectives"][2], "Settle_Time": s["objectives"][3], "MW": s["MW"]
+                    } for s in pareto]).to_excel(writer, sheet_name=f"Pareto_{algo}", index=False)
+
+                    hv, sp, knee = compute_hypervolume(pareto), compute_spacing(pareto), find_knee(pareto)
+                    if knee:
+                        pd.DataFrame([{
+                            "Hypervolume": hv, "Spacing": sp,
+                            "Knee_Cost": knee["objectives"][0], "Knee_VDI": knee["objectives"][1],
+                            "Knee_Settle": knee["objectives"][3]
+                        }]).to_excel(writer, sheet_name=f"MOO_{algo}", index=False)
+
+                if "Log" in data and data["Log"]:
+                    pd.DataFrame(data["Log"]).to_excel(writer, sheet_name=f"Log_{algo}", index=False)
+
+            # 3. GBest Detail Sheets
+            for algo, data in results_dict.items():
+                pareto = data.get("Pareto", [])
+                if not pareto: continue
+                
+                knee = find_knee(pareto)
+                if not knee: continue
+
+                best_pattern = knee["pattern"]
+                shed_rows = []
+                for i, load in enumerate(all_loads):
+                    shed_rows.append({
+                        "Load_Name": load.GetAttribute("loc_name"),
+                        "Zone": ZONE_LABELS[i],
+                        "Cost_Weight": COST_MAP[i],
+                        "MW": load.GetAttribute("plini"),
+                        "Shed": "YES" if best_pattern[i] == 1 else "NO"
+                    })
+
+                shed_df = pd.DataFrame(shed_rows)
+                summary_row = pd.DataFrame([{
+                    "Load_Name": "--- TOTAL ---", "Zone": "", "Cost_Weight": "",
+                    "MW": knee["MW"],
+                    "Shed": f"Cost={knee['Cost']:.2f}, VDI={knee['VDI']:.6f}, Over={knee['Over']:.3f}, Settle={knee['Settle']:.2f}s"
+                }])
+                shed_df = pd.concat([shed_df, summary_row], ignore_index=True)
+                shed_df.to_excel(writer, sheet_name=f"GBest_{algo}", index=False)
+
+                # Re-simulate untuk time series
+                print(f"Re-simulating G_best for {algo} time-series export...")
+                freq_df, volt_df = simulate_and_extract_timeseries(best_pattern)
+                if freq_df is not None:
+                    freq_df.to_excel(writer, sheet_name=f"Freq_{algo}", index=False)
+                if volt_df is not None:
+                    volt_df.to_excel(writer, sheet_name=f"Volt_{algo}", index=False)
+                    
+        print(f"Export berhasil. Data tersimpan di {output_file}")
+    except Exception as e:
+        print(f"Gagal melakukan export ke Excel: {e}")
 
 
 if __name__ == "__main__":
     calc_target = apply_contingency_and_reset()
     setup_rms_simulation_and_events()  # Setup result variables & dynamic RMS events
-    results_store = {}
-    algos = ["PSO", "WOA", "GWO"]
 
-    for algo in algos:
-        opt = Optimizer(algo, calc_target)
-        metrics, curve, duration, log, best_pat, pareto = opt.run()
-        results_store[algo] = {
-            "Metrics": metrics, "Curve": curve, "Time": duration,
-            "Log": log, "Best_Pattern": best_pat, "Pareto": pareto
-        }
+    # Parse nama file dasar dan nomor RUN awal
+    match = re.search(r'(.*?_RUN\s*)(\d+)(.*)', EXCEL_OUTPUT, re.IGNORECASE)
+    if match:
+        base_prefix = match.group(1)
+        start_run = int(match.group(2))
+        extension = match.group(3)
+    else:
+        base_prefix = EXCEL_OUTPUT.replace(".xlsx", "_RUN_")
+        start_run = 1
+        extension = ".xlsx"
 
-    print(f"Exporting to {EXCEL_OUTPUT}...")
-    with pd.ExcelWriter(EXCEL_OUTPUT, engine='openpyxl') as writer:
-        # 1. Summary Sheet
-        summary_df = pd.DataFrame([{
-            "Algorithm": a, "Knee_Cost": results_store[a]["Metrics"].get("Cost", 0),
-            "Knee_Vmin": results_store[a]["Metrics"].get("Vmin", 0), "Time_Sec": results_store[a]["Time"]
-        } for a in algos])
-        summary_df.to_excel(writer, sheet_name='Summary', index=False)
+    for current_run in range(start_run, start_run + TOTAL_RUNS):
+        current_excel_output = f"{base_prefix}{current_run}{extension}"
+        print(f"\n{'='*50}\nMEMULAI SIMULASI {current_excel_output.upper()} ({current_run - start_run + 1}/{TOTAL_RUNS})\n{'='*50}")
+        
+        results_store = {}
+        algos = ["PSO", "WOA", "GWO"]
 
-        # 2. Pareto & MOO Metrics Loop
-        for algo in algos:
-            pareto = results_store[algo]["Pareto"]
-            if not pareto: continue
+        try:
+            for algo in algos:
+                opt = Optimizer(algo, calc_target)
+                metrics, curve, duration, log, best_pat, pareto = opt.run()
+                results_store[algo] = {
+                    "Metrics": metrics, "Curve": curve, "Time": duration,
+                    "Log": log, "Best_Pattern": best_pat, "Pareto": pareto
+                }
+                # Auto-save setelah tiap algoritma di dalam iterasi file ini selesai
+                export_to_excel(results_store, current_excel_output)
+                
+        except KeyboardInterrupt:
+            print(f"\n[!] Eksekusi {current_excel_output} dihentikan paksa (Ctrl+C). Menyimpan progress...")
+            export_to_excel(results_store, current_excel_output)
+            print(f"Progress untuk {current_excel_output} telah diamankan. Menghentikan simulasi total.")
+            break  # Berhenti dari loop TOTAL_RUNS karena user meminta berhenti paksa
+            
+        except Exception as e:
+            print(f"\n[!] Terjadi error saat menjalankan simulasi untuk {current_excel_output}: {e}")
+            import traceback
+            traceback.print_exc()
+            print(f"Menyimpan progress yang ada ke {current_excel_output} sebelum melanjutkan ke iterasi RUN berikutnya...")
+            export_to_excel(results_store, current_excel_output)
+            continue  # Lanjut ke nomor RUN berikutnya
 
-            # Pareto List
-            pd.DataFrame([{
-                "Cost": s["objectives"][0], "VDI": s["objectives"][1],
-                "Overshed": s["objectives"][2], "Settle_Time": s["objectives"][3], "MW": s["MW"]
-            } for s in pareto]).to_excel(writer, sheet_name=f"Pareto_{algo}", index=False)
-
-            # MOO Quality Metrics
-            hv, sp, knee = compute_hypervolume(pareto), compute_spacing(pareto), find_knee(pareto)
-            pd.DataFrame([{
-                "Hypervolume": hv, "Spacing": sp,
-                "Knee_Cost": knee["objectives"][0], "Knee_VDI": knee["objectives"][1],
-                "Knee_Settle": knee["objectives"][3]
-            }]).to_excel(writer, sheet_name=f"MOO_{algo}", index=False)
-
-            # Logs
-            pd.DataFrame(results_store[algo]["Log"]).to_excel(writer, sheet_name=f"Log_{algo}", index=False)
-
-        # 3. GBest Detail Sheets per Algorithm
-        for algo in algos:
-            pareto = results_store[algo]["Pareto"]
-            if not pareto:
-                continue
-
-            # Cari knee point sebagai solusi terbaik
-            knee = find_knee(pareto)
-            if knee is None:
-                continue
-
-            best_pattern = knee["pattern"]
-
-            # --- Sheet: Load Shedding Summary ---
-            shed_rows = []
-            for i, load in enumerate(all_loads):
-                load_name = load.GetAttribute("loc_name")
-                load_mw = load.GetAttribute("plini")
-                shed_rows.append({
-                    "Load_Name": load_name,
-                    "Zone": ZONE_LABELS[i],
-                    "Cost_Weight": COST_MAP[i],
-                    "MW": load_mw,
-                    "Shed": "YES" if best_pattern[i] == 1 else "NO"
-                })
-
-            shed_df = pd.DataFrame(shed_rows)
-
-            # Tambahkan baris summary di bawah
-            summary_row = pd.DataFrame([{
-                "Load_Name": "--- TOTAL ---",
-                "Zone": "",
-                "Cost_Weight": "",
-                "MW": knee["MW"],
-                "Shed": f"Cost={knee['Cost']:.2f}, VDI={knee['VDI']:.6f}, Over={knee['Over']:.3f}, Settle={knee['Settle']:.2f}s"
-            }])
-            shed_df = pd.concat([shed_df, summary_row], ignore_index=True)
-            shed_df.to_excel(writer, sheet_name=f"GBest_{algo}", index=False)
-
-            # --- Re-simulate untuk time series ---
-            print(f"Re-simulating G_best for {algo}...")
-            freq_df, volt_df = simulate_and_extract_timeseries(best_pattern)
-
-            if freq_df is not None:
-                freq_df.to_excel(writer, sheet_name=f"Freq_{algo}", index=False)
-            if volt_df is not None:
-                volt_df.to_excel(writer, sheet_name=f"Volt_{algo}", index=False)
-
-    print("Proses Selesai Berhasil.")
+    print("\nSeluruh Proses Berurutan Selesai Berhasil.")

@@ -7,9 +7,9 @@ import pandas as pd
 import re
 
 # --- KONFIGURASI SISTEM ---
-TARGET_GEN_TRIP = "DG_1"
-EXCEL_OUTPUT = "DG 1_RUN 1.xlsx"
-TOTAL_RUNS = 5  # Jumlah eksekusi algoritma berulang (otomatis bertambah)
+TARGET_GEN_TRIP = "DG_3"
+EXCEL_OUTPUT = "DG 3_RUN 6.xlsx"
+TOTAL_RUNS = 1  # Jumlah eksekusi algoritma berulang (otomatis bertambah)
 
 # Parameter Optimasi
 SEARCH_AGENTS = 25
@@ -17,7 +17,7 @@ MAX_ITER = 50
 DIMENSION = 33
 
 USE_HARDCODED_TARGET = True
-TARGET_DEFICIT_MW = 1.350
+TARGET_DEFICIT_MW = 1.200
 
 # Parameter Algoritma
 W_MAX = 0.9
@@ -26,6 +26,7 @@ C1_PSO = 2.0
 C2_PSO = 2.0
 VOLT_MIN = 0.95
 VOLT_MAX = 1.05
+TRANSFER_FUNCTION = "v_shape"  # Pilihan: "sigmoid" atau "v_shape"
 
 # Parameter Simulasi RMS
 RMS_TSTOP = 100.0        # Total waktu simulasi (detik)
@@ -46,7 +47,7 @@ VOLT_MONITOR_BUS_IDX = 17 # Indeks bus untuk monitoring tegangan vs waktu di exp
 VERSION_PYTHON = "3.12"
 PATH_APP = r"C:\Program Files\DIgSILENT\PowerFactory 2024"
 PATH_API = fr"{PATH_APP}\Python\{VERSION_PYTHON}"
-PROJECT_NAME = "Import(6)"
+PROJECT_NAME = "Import(8)"
 
 if PATH_API not in sys.path: sys.path.append(PATH_API)
 os.environ['PATH'] = PATH_APP + ";" + os.environ['PATH']
@@ -64,16 +65,10 @@ try:
 except:
     pass
 
-# Inisialisasi perintah simulasi RMS
-inc = app.GetFromStudyCase("ComInc")   # Initial Conditions
-sim = app.GetFromStudyCase("ComSim")   # RMS Simulation
-elmres = app.GetFromStudyCase("All calculations.ElmRes")  # Result Object
-
-# Debug: verifikasi objek simulasi
-print(f"[INIT] ComInc: {inc}, ComSim: {sim}, ElmRes: {elmres}")
-
-# Konfigurasi waktu simulasi
-sim.tstop = RMS_TSTOP
+# Deklarasi variabel global yang akan diisi oleh fungsi initialize_network_objects()
+inc, sim, elmres = None, None, None
+all_loads, all_buses, all_gens = [], [], []
+COST_MAP, ZONE_LABELS = [], []
 
 
 # --- FUNGSI PENDUKUNG ---
@@ -83,6 +78,10 @@ def natural_keys(text):
 
 def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
+
+
+def v_shape(x):
+    return np.abs(np.tanh(x))
 
 
 def setup_rms_simulation_and_events():
@@ -138,9 +137,7 @@ def setup_rms_simulation_and_events():
 
 
 def extract_rms_results():
-    """Membaca tegangan (pada RMS_TSAMPLE) dan settling time frekuensi secara optimal.
-    Menghindari iterasi 10k+ baris berulang kali dengan Binary Search dan sparse sampling.
-    """
+    
     elmres.Load()
     n_rows = elmres.GetNumberOfRows()
 
@@ -312,30 +309,38 @@ def find_knee(pareto):
     return pareto[int(np.argmin(dist))]
 
 
-# --- INISIALISASI OBJEK POWERFACTORY ---
-raw_loads = app.GetCalcRelevantObjects("*.ElmLod")
-all_loads = [obj for obj in raw_loads if obj.GetClassName() == "ElmLod"]
-all_loads.sort(key=lambda x: natural_keys(x.GetAttribute("loc_name")))
+def initialize_network_objects():
+    global all_loads, all_buses, all_gens, COST_MAP, ZONE_LABELS, inc, sim, elmres
+    
+    # Inisialisasi perintah simulasi RMS
+    inc = app.GetFromStudyCase("ComInc")
+    sim = app.GetFromStudyCase("ComSim")
+    elmres = app.GetFromStudyCase("All calculations.ElmRes")
+    sim.tstop = RMS_TSTOP
+    
+    raw_loads = app.GetCalcRelevantObjects("*.ElmLod")
+    all_loads = [obj for obj in raw_loads if obj.GetClassName() == "ElmLod"]
+    all_loads.sort(key=lambda x: natural_keys(x.GetAttribute("loc_name")))
 
-all_buses = app.GetCalcRelevantObjects("*.ElmTerm")
-all_buses.sort(key=lambda x: natural_keys(x.GetAttribute("loc_name")))
+    all_buses = app.GetCalcRelevantObjects("*.ElmTerm")
+    all_buses.sort(key=lambda x: natural_keys(x.GetAttribute("loc_name")))
 
-all_gens = app.GetCalcRelevantObjects("*.ElmSym") + app.GetCalcRelevantObjects("*.ElmGenstat")
+    all_gens = app.GetCalcRelevantObjects("*.ElmSym") + app.GetCalcRelevantObjects("*.ElmGenstat")
 
-# Mapping Prioritas Zona
-COST_MAP = []
-ZONE_LABELS = []
-for i in range(len(all_loads)):
-    if 0 <= i <= 4:
-        cost, zone = 1000.0, "Zone 1"
-    elif 5 <= i <= 16:
-        cost, zone = 50.0, "Zone 2"
-    elif 17 <= i <= 23:
-        cost, zone = 200.0, "Zone 3"
-    else:
-        cost, zone = 500.0, "Zone 4"
-    COST_MAP.append(cost)
-    ZONE_LABELS.append(zone)
+    # Mapping Prioritas Zona
+    COST_MAP = []
+    ZONE_LABELS = []
+    for i in range(len(all_loads)):
+        if 0 <= i <= 4:
+            cost, zone = 1000.0, "Zone 1"
+        elif 5 <= i <= 16:
+            cost, zone = 50.0, "Zone 2"
+        elif 17 <= i <= 23:
+            cost, zone = 200.0, "Zone 3"
+        else:
+            cost, zone = 500.0, "Zone 4"
+        COST_MAP.append(cost)
+        ZONE_LABELS.append(zone)
 
 
 # --- CORE LOGIC ---
@@ -347,7 +352,11 @@ def apply_contingency_and_reset():
 
 
 def calculate_fitness(position_continuous, min_shed_required):
-    probs = sigmoid(position_continuous)
+    if TRANSFER_FUNCTION == "v_shape":
+        probs = v_shape(position_continuous)
+    else:
+        probs = sigmoid(position_continuous)
+        
     pattern = (np.random.rand(len(position_continuous)) < probs).astype(int)
 
     # Terapkan pola load shedding ke dynamic events (Aktifkan event jika pattern = 1)
@@ -609,9 +618,6 @@ def export_to_excel(results_dict, output_file):
 
 
 if __name__ == "__main__":
-    calc_target = apply_contingency_and_reset()
-    setup_rms_simulation_and_events()  # Setup result variables & dynamic RMS events
-
     # Parse nama file dasar dan nomor RUN awal
     match = re.search(r'(.*?_RUN\s*)(\d+)(.*)', EXCEL_OUTPUT, re.IGNORECASE)
     if match:
@@ -623,10 +629,47 @@ if __name__ == "__main__":
         start_run = 1
         extension = ".xlsx"
 
+    # Penentuan base nama project (misal: "Import(8)" -> base="Import(", idx=8, suffix=")")
+    match_proj = re.search(r'(.*?\(?)(\d+)(\)?)', PROJECT_NAME)
+    if match_proj:
+        proj_base = match_proj.group(1)
+        start_proj_idx = int(match_proj.group(2))
+        proj_suffix = match_proj.group(3)
+    else:
+        proj_base = PROJECT_NAME
+        start_proj_idx = 1
+        proj_suffix = ""
+
+    last_active_project = PROJECT_NAME
+
     for current_run in range(start_run, start_run + TOTAL_RUNS):
         current_excel_output = f"{base_prefix}{current_run}{extension}"
-        print(f"\n{'='*50}\nMEMULAI SIMULASI {current_excel_output.upper()} ({current_run - start_run + 1}/{TOTAL_RUNS})\n{'='*50}")
         
+        if match_proj:
+            current_proj_idx = start_proj_idx + (current_run - start_run)
+            current_proj_name = f"{proj_base}{current_proj_idx}{proj_suffix}"
+        else:
+            current_proj_name = PROJECT_NAME
+
+        print(f"\n{'='*50}\nMEMULAI SIMULASI {current_excel_output.upper()} ({current_run - start_run + 1}/{TOTAL_RUNS})\n{'='*50}")
+        print(f"Mencoba mengaktifkan project: {current_proj_name}")
+        
+        err = app.ActivateProject(current_proj_name)
+        if err != 0:
+            print(f"[WARNING] Project '{current_proj_name}' gagal diaktifkan / tidak ditemukan.")
+            print(f"-> Fallback: Tetap menggunakan project '{last_active_project}'")
+            app.ActivateProject(last_active_project)
+            current_proj_name = last_active_project
+        else:
+            print(f"-> Berhasil mengaktifkan '{current_proj_name}'")
+            last_active_project = current_proj_name
+
+        # Re-inisialisasi objek network untuk project yang aktif saat ini
+        initialize_network_objects()
+        
+        calc_target = apply_contingency_and_reset()
+        setup_rms_simulation_and_events()
+
         results_store = {}
         algos = ["PSO", "WOA", "GWO"]
 
@@ -638,21 +681,18 @@ if __name__ == "__main__":
                     "Metrics": metrics, "Curve": curve, "Time": duration,
                     "Log": log, "Best_Pattern": best_pat, "Pareto": pareto
                 }
-                # Auto-save setelah tiap algoritma di dalam iterasi file ini selesai
                 export_to_excel(results_store, current_excel_output)
                 
         except KeyboardInterrupt:
-            print(f"\n[!] Eksekusi {current_excel_output} dihentikan paksa (Ctrl+C). Menyimpan progress...")
+            print(f"\n[!] Eksekusi {current_excel_output} dihentikan paksa (Ctrl+C).")
             export_to_excel(results_store, current_excel_output)
-            print(f"Progress untuk {current_excel_output} telah diamankan. Menghentikan simulasi total.")
-            break  # Berhenti dari loop TOTAL_RUNS karena user meminta berhenti paksa
+            break
             
         except Exception as e:
-            print(f"\n[!] Terjadi error saat menjalankan simulasi untuk {current_excel_output}: {e}")
+            print(f"\n[!] Error saat menjalankan {current_excel_output}: {e}")
             import traceback
             traceback.print_exc()
-            print(f"Menyimpan progress yang ada ke {current_excel_output} sebelum melanjutkan ke iterasi RUN berikutnya...")
             export_to_excel(results_store, current_excel_output)
-            continue  # Lanjut ke nomor RUN berikutnya
+            continue
 
     print("\nSeluruh Proses Berurutan Selesai Berhasil.")

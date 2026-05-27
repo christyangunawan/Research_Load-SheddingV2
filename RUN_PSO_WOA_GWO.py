@@ -8,7 +8,7 @@ import re
 
 # --- KONFIGURASI SISTEM ---
 TARGET_GEN_TRIP = "DG_3"
-EXCEL_OUTPUT = "DG 3_RUN 6.xlsx"
+EXCEL_OUTPUT = "DG 3_RUN 10.xlsx"
 TOTAL_RUNS = 1  # Jumlah eksekusi algoritma berulang (otomatis bertambah)
 
 # Parameter Optimasi
@@ -26,7 +26,7 @@ C1_PSO = 2.0
 C2_PSO = 2.0
 VOLT_MIN = 0.95
 VOLT_MAX = 1.05
-TRANSFER_FUNCTION = "v_shape"  # Pilihan: "sigmoid" atau "v_shape"
+TRANSFER_FUNCTION = "sigmoid"  # Pilihan: "sigmoid" atau "v_shape"
 
 # Parameter Simulasi RMS
 RMS_TSTOP = 100.0        # Total waktu simulasi (detik)
@@ -47,7 +47,7 @@ VOLT_MONITOR_BUS_IDX = 17 # Indeks bus untuk monitoring tegangan vs waktu di exp
 VERSION_PYTHON = "3.12"
 PATH_APP = r"C:\Program Files\DIgSILENT\PowerFactory 2024"
 PATH_API = fr"{PATH_APP}\Python\{VERSION_PYTHON}"
-PROJECT_NAME = "Import(8)"
+PROJECT_NAME = "Import(5)"
 
 if PATH_API not in sys.path: sys.path.append(PATH_API)
 os.environ['PATH'] = PATH_APP + ";" + os.environ['PATH']
